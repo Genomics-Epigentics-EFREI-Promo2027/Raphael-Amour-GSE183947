@@ -1,0 +1,755 @@
+---
+title: "Differential RNA-seq Analysis — Breast Cancer (GSE183947)"
+subtitle: "Breast tumor vs. adjacent non-tumor tissue · DESeq2 pipeline"
+author: "Raphael"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+    theme: flatly
+    highlight: kate
+    code_folding: show
+    fig_width: 10
+    fig_height: 6
+    df_print: paged
+---
+
+```{r knitr-options, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  cache     = FALSE,
+  dpi       = 150,
+  fig.align = "center"
+)
+```
+
+---
+
+# 1. Packages and Configuration
+
+```{r packages}
+library(tidyverse)
+library(ggrepel)
+library(RColorBrewer)
+library(scales)
+library(patchwork)
+library(DESeq2)
+library(apeglm)
+```
+
+```{r setup-paths}
+dir.create("output/plots",   recursive = TRUE, showWarnings = FALSE)
+dir.create("output/results", recursive = TRUE, showWarnings = FALSE)
+
+COLS <- c(Adjacent = "#3182BD", Tumor = "#E6550D")
+
+theme_set(
+  theme_bw(base_size = 13) +
+    theme(
+      plot.title      = element_text(face = "bold", size = 14),
+      plot.subtitle   = element_text(color = "grey40"),
+      legend.position = "right"
+    )
+)
+```
+
+---
+
+# 2. Data Import & Inspection
+
+```{r load-data}
+data_file <- "data/GSE183947_fpkm.csv"
+
+fpkm_raw <- read.csv(data_file,
+                     row.names        = 1,
+                     check.names      = FALSE,
+                     stringsAsFactors = FALSE)
+
+cat(sprintf("Dimensions: %d genes × %d samples\n", nrow(fpkm_raw), ncol(fpkm_raw)))
+fpkm_raw[1:5, 1:6]
+```
+
+```{r metadata}
+sample_ids <- colnames(fpkm_raw)
+
+metadata <- data.frame(
+  sample    = sample_ids,
+  condition = ifelse(startsWith(sample_ids, "CAP"), "Adjacent", "Tumor"),
+  patient   = sub("^CA[P]?\\.", "", sample_ids),
+  row.names = sample_ids,
+  stringsAsFactors = FALSE
+)
+
+metadata$condition <- factor(metadata$condition, levels = c("Adjacent", "Tumor"))
+
+print(table(metadata$condition))
+```
+
+---
+
+# 3. Preprocessing — FPKM to Pseudo-counts
+
+> **Methodological note:** DESeq2 requires raw integer counts (negative binomial model). Since FPKM values are already normalized by sequencing depth and gene length, conversion to pseudo-counts is necessary. We use proportional scaling to a target depth of 10 million reads per sample, which preserves relative expression ratios between genes within each sample.
+
+```{r fpkm-to-counts}
+target_depth    <- 1e7
+col_totals      <- colSums(fpkm_raw)
+scaling_factors <- target_depth / col_totals
+
+pseudo_counts <- round(
+  sweep(as.matrix(fpkm_raw), MARGIN = 2, STATS = scaling_factors, FUN = "*")
+)
+pseudo_counts <- pmax(pseudo_counts, 0L)
+mode(pseudo_counts) <- "integer"
+
+cat(sprintf("Pseudo-counts: min = %d, max = %d, median = %.1f\n",
+            min(pseudo_counts), max(pseudo_counts), median(pseudo_counts)))
+```
+
+```{r filter-genes}
+min_count   <- 10
+min_samples <- round(0.30 * ncol(pseudo_counts))
+keep        <- rowSums(pseudo_counts >= min_count) >= min_samples
+
+pseudo_filt <- pseudo_counts[keep, ]
+fpkm_filt   <- fpkm_raw[keep, ]
+
+cat(sprintf("Genes retained after filtering: %d / %d (%.1f%%)\n",
+            sum(keep), nrow(pseudo_counts), 100 * mean(keep)))
+```
+
+---
+
+# 4. Differential Expression Analysis with DESeq2
+
+```{r deseq2-object}
+stopifnot(identical(colnames(pseudo_filt), rownames(metadata)))
+
+dds <- DESeqDataSetFromMatrix(
+  countData = pseudo_filt,
+  colData   = metadata,
+  design    = ~ condition
+)
+dds$condition <- relevel(dds$condition, ref = "Adjacent")
+print(dds)
+```
+
+```{r deseq2-run}
+set.seed(42)
+dds <- DESeq(dds)
+
+res_raw <- results(
+  dds,
+  contrast      = c("condition", "Tumor", "Adjacent"),
+  alpha         = 0.05,
+  pAdjustMethod = "BH"
+)
+summary(res_raw)
+```
+
+```{r lfc-shrinkage}
+res_shrunk <- lfcShrink(
+  dds,
+  coef  = "condition_Tumor_vs_Adjacent",
+  type  = "apeglm",
+  quiet = TRUE
+)
+summary(res_shrunk)
+```
+
+```{r results-table}
+res_df <- as.data.frame(res_shrunk) %>%
+  rownames_to_column("gene") %>%
+  arrange(padj) %>%
+  mutate(
+    regulation = case_when(
+      padj < 0.05 & log2FoldChange >  1 ~ "Up",
+      padj < 0.05 & log2FoldChange < -1 ~ "Down",
+      TRUE                              ~ "NS"
+    ),
+    regulation = factor(regulation, levels = c("Up", "Down", "NS"))
+  )
+
+cat(sprintf("Up: %d  |  Down: %d  |  Total DE: %d\n",
+            sum(res_df$regulation == "Up"),
+            sum(res_df$regulation == "Down"),
+            sum(res_df$regulation %in% c("Up", "Down"))))
+
+write.csv(res_df, "output/results/DESeq2_all_results.csv", row.names = FALSE)
+res_df %>% filter(regulation != "NS") %>%
+  write.csv("output/results/DESeq2_DE_genes.csv", row.names = FALSE)
+
+res_df %>%
+  filter(regulation != "NS") %>%
+  head(30) %>%
+  select(gene, log2FoldChange, lfcSE, baseMean, pvalue, padj, regulation) %>%
+  mutate(across(where(is.numeric), ~ signif(.x, 4)))
+```
+
+---
+
+# 5. Quality Control & Visualizations
+
+## 5.1 Count Distribution Before/After Normalization
+
+```{r qc-distribution, fig.height=5}
+vsd <- vst(dds, blind = TRUE)
+
+vst_long <- assay(vsd) %>%
+  as.data.frame() %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "vst") %>%
+  left_join(metadata %>% select(sample, condition), by = "sample")
+
+p_box <- ggplot(vst_long,
+                aes(x = reorder(sample, as.integer(condition)), y = vst, fill = condition)) +
+  geom_boxplot(outlier.size = 0.3, outlier.alpha = 0.2, lwd = 0.3) +
+  scale_fill_manual(values = COLS) +
+  labs(title    = "VST count distribution per sample",
+       subtitle = "After DESeq2 normalization and variance stabilizing transformation",
+       x = "Sample", y = "VST") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 5))
+
+print(p_box)
+ggsave("output/plots/01_boxplot_vst.png", p_box, width = 14, height = 5, dpi = 150)
+```
+
+The boxplots show comparable VST distributions across all 60 samples, indicating that normalization was successful. The median expression levels are consistent within each group, with no obvious outlier samples.
+
+## 5.2 Density Curves
+
+```{r qc-density, fig.height=4}
+df_fpkm_dens <- fpkm_filt %>%
+  as.data.frame() %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "fpkm") %>%
+  left_join(metadata %>% select(sample, condition), by = "sample") %>%
+  mutate(log2fpkm = log2(fpkm + 1))
+
+p_dens_raw <- ggplot(df_fpkm_dens,
+                     aes(x = log2fpkm, color = condition, group = sample)) +
+  geom_density(alpha = 0.6, linewidth = 0.4) +
+  scale_color_manual(values = COLS) +
+  labs(title = "Raw FPKM (log2+1)", x = "log2(FPKM + 1)", y = "Density") +
+  theme(legend.position = "bottom")
+
+p_dens_vst <- ggplot(vst_long,
+                     aes(x = vst, color = condition, group = sample)) +
+  geom_density(alpha = 0.6, linewidth = 0.4) +
+  scale_color_manual(values = COLS) +
+  labs(title = "Post-VST", x = "VST", y = "") +
+  theme(legend.position = "bottom")
+
+p_density <- p_dens_raw + p_dens_vst +
+  plot_annotation(title = "Variance stabilization by VST",
+                  theme = theme(plot.title = element_text(face = "bold")))
+
+print(p_density)
+ggsave("output/plots/02_density_raw_vs_vst.png", p_density, width = 12, height = 5, dpi = 150)
+```
+
+The raw FPKM curves show some variability in shape between samples, while the post-VST curves are much more uniform. This confirms that the variance stabilization step effectively reduces technical noise before downstream analysis.
+
+## 5.3 PCA
+
+```{r pca, fig.height=6}
+pca_data <- plotPCA(vsd, intgroup = "condition", returnData = TRUE)
+pct_var  <- round(100 * attr(pca_data, "percentVar"), 1)
+
+p_pca <- ggplot(pca_data, aes(x = PC1, y = PC2, color = condition, label = name)) +
+  stat_ellipse(aes(fill = condition), geom = "polygon",
+               alpha = 0.08, level = 0.95, show.legend = FALSE) +
+  geom_point(size = 3.5, alpha = 0.85) +
+  geom_text_repel(size = 2.8, max.overlaps = 15, box.padding = 0.3) +
+  scale_color_manual(values = COLS) +
+  scale_fill_manual(values  = COLS) +
+  labs(
+    title    = "PCA — Tumor vs. Adjacent Tissue",
+    subtitle = "VST data (top 500 most variable genes)",
+    x        = paste0("PC1 (", pct_var[1], "% variance)"),
+    y        = paste0("PC2 (", pct_var[2], "% variance)"),
+    color    = "Condition"
+  )
+
+print(p_pca)
+ggsave("output/plots/03_PCA.png", p_pca, width = 10, height = 7, dpi = 150)
+```
+
+PC1 clearly separates Tumor from Adjacent samples, capturing the main source of biological variation in the dataset. The tight clustering within each group suggests good replicate consistency and confirms that condition is the dominant driver of transcriptomic differences.
+
+## 5.4 Sample Distance Heatmap
+
+```{r sample-distance-heatmap, fig.height=8, fig.width=9}
+vst_mat       <- assay(vsd)
+samp_dists    <- dist(t(vst_mat))
+samp_dist_mat <- as.matrix(samp_dists)
+
+hc_order        <- hclust(samp_dists, method = "complete")$order
+ordered_samples <- rownames(samp_dist_mat)[hc_order]
+
+dist_long <- samp_dist_mat %>%
+  as.data.frame() %>%
+  rownames_to_column("sample1") %>%
+  pivot_longer(-sample1, names_to = "sample2", values_to = "distance") %>%
+  mutate(
+    sample1 = factor(sample1, levels = ordered_samples),
+    sample2 = factor(sample2, levels = ordered_samples)
+  ) %>%
+  left_join(dplyr::rename(metadata, sample1 = sample, cond1 = condition), by = "sample1") %>%
+  left_join(dplyr::rename(metadata, sample2 = sample, cond2 = condition), by = "sample2")
+
+p_dist <- ggplot(dist_long, aes(x = sample1, y = sample2, fill = distance)) +
+  geom_tile() +
+  scale_fill_gradientn(
+    colours = c("#08306B", "#2171B5", "#6BAED6", "#C6DBEF", "white"),
+    name    = "Euclidean\ndistance"
+  ) +
+  labs(title    = "Euclidean distance between samples (VST)",
+       subtitle = "Ordered by hierarchical clustering",
+       x = NULL, y = NULL) +
+  theme(
+    axis.text.x  = element_text(angle = 90, hjust = 1, size = 5),
+    axis.text.y  = element_text(size = 5),
+    panel.border = element_blank(),
+    panel.grid   = element_blank()
+  )
+
+print(p_dist)
+ggsave("output/plots/04_sample_distance_heatmap.png", p_dist, width = 10, height = 9, dpi = 150)
+```
+
+The heatmap shows two distinct blocks along the diagonal, corresponding to Adjacent and Tumor groups. Samples within the same condition are clearly more similar to each other than to samples from the other group, which validates the experimental design.
+
+## 5.5 DESeq2 Dispersion Estimates
+
+```{r dispersion-plot, fig.height=5}
+disp_df <- data.frame(
+  baseMean    = mcols(dds)$baseMean,
+  dispGeneEst = mcols(dds)$dispGeneEst,
+  dispFit     = mcols(dds)$dispFit,
+  dispMAP     = mcols(dds)$dispMAP,
+  dispOutlier = mcols(dds)$dispOutlier
+) %>% filter(!is.na(dispGeneEst) & baseMean > 0)
+
+p_disp <- ggplot(disp_df, aes(x = baseMean, y = dispGeneEst)) +
+  geom_point(aes(color = dispOutlier), size = 0.6, alpha = 0.3) +
+  geom_line(aes(y = dispFit), color = "#D62728", linewidth = 0.8, na.rm = TRUE) +
+  geom_point(aes(y = dispMAP), color = "#1F77B4", size = 0.4, alpha = 0.2) +
+  scale_x_log10(labels = label_comma()) +
+  scale_y_log10() +
+  scale_color_manual(
+    values = c(`FALSE` = "grey60", `TRUE` = "#FF7F0E"),
+    labels = c(`FALSE` = "Non-outlier", `TRUE` = "Outlier"),
+    name   = NULL
+  ) +
+  labs(
+    title    = "Dispersion estimates — DESeq2",
+    subtitle = "Grey: gene-wise estimate · Red: fitted trend · Blue: MAP (shrinkage)",
+    x        = "Mean normalized counts",
+    y        = "Dispersion"
+  )
+
+print(p_disp)
+ggsave("output/plots/05_dispersion_estimates.png", p_disp, width = 9, height = 5, dpi = 150)
+```
+
+The dispersion plot shows the expected trend: genes with low mean expression have higher dispersion, which decreases as expression increases. The fitted trend (red) closely follows the gene-wise estimates, and the MAP values (blue) are appropriately shrunk toward the fit, indicating a well-behaved model.
+
+---
+
+# 6. Results Visualization
+
+## 6.1 Volcano Plot
+
+```{r volcano-plot, fig.height=7}
+LFC_THRESH  <- 1.0
+PADJ_THRESH <- 0.05
+
+res_plot <- res_df %>%
+  mutate(
+    neg_log10_padj = -log10(pmax(padj, 1e-300)),
+    padj           = replace_na(padj, 1)
+  )
+
+top_annot <- res_plot %>%
+  filter(regulation != "NS") %>%
+  arrange(padj, desc(abs(log2FoldChange))) %>%
+  head(20)
+
+p_volcano <- ggplot(res_plot,
+                    aes(x = log2FoldChange, y = neg_log10_padj,
+                        color = regulation, size = regulation)) +
+  geom_point(data = . %>% filter(regulation == "NS"), alpha = 0.25) +
+  geom_point(data = . %>% filter(regulation != "NS"), alpha = 0.7) +
+  geom_vline(xintercept = c(-LFC_THRESH, LFC_THRESH),
+             linetype = "dashed", color = "grey40", linewidth = 0.6) +
+  geom_hline(yintercept = -log10(PADJ_THRESH),
+             linetype = "dashed", color = "grey40", linewidth = 0.6) +
+  geom_text_repel(data = top_annot, aes(label = gene),
+                  size = 3, max.overlaps = 25,
+                  box.padding = 0.4, segment.color = "grey50", show.legend = FALSE) +
+  scale_color_manual(
+    values = c(Up = "#D62728", Down = "#1F77B4", NS = "grey70"),
+    labels = c(Up = "Upregulated (Tumor)", Down = "Downregulated (Tumor)", NS = "NS"),
+    name   = NULL
+  ) +
+  scale_size_manual(values = c(Up = 1.8, Down = 1.8, NS = 0.7), guide = "none") +
+  annotate("text",
+           x = max(res_plot$log2FoldChange, na.rm = TRUE) * 0.85,
+           y = max(res_plot$neg_log10_padj, na.rm = TRUE) * 0.95,
+           label = paste0("Up: ", sum(res_df$regulation == "Up")),
+           color = "#D62728", fontface = "bold", size = 4.5) +
+  annotate("text",
+           x = min(res_plot$log2FoldChange, na.rm = TRUE) * 0.85,
+           y = max(res_plot$neg_log10_padj, na.rm = TRUE) * 0.95,
+           label = paste0("Down: ", sum(res_df$regulation == "Down")),
+           color = "#1F77B4", fontface = "bold", size = 4.5) +
+  labs(
+    title    = "Volcano Plot — Tumor vs. Adjacent Tissue",
+    subtitle = "DESeq2 + apeglm shrinkage  ·  thresholds: |LFC| > 1, padj < 0.05",
+    x        = expression(log[2]~"Fold Change (Tumor / Adjacent)"),
+    y        = expression(-log[10]~"(p.adj)")
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 3)))
+
+print(p_volcano)
+ggsave("output/plots/06_volcano_plot.png", p_volcano, width = 10, height = 7, dpi = 150)
+```
+
+The volcano plot highlights a strong and asymmetric differential expression pattern, with considerably more downregulated than upregulated genes in tumor tissue. The most significant genes (RNASE11, CCDC177, MFRP) show both high fold changes and very low adjusted p-values, making them strong candidates for further investigation.
+
+## 6.2 MA Plot
+
+```{r ma-plot, fig.height=5}
+p_ma <- res_df %>%
+  filter(!is.na(log2FoldChange) & !is.na(baseMean) & baseMean > 0) %>%
+  mutate(baseMean_log = log10(baseMean + 1)) %>%
+  ggplot(aes(x = baseMean_log, y = log2FoldChange, color = regulation)) +
+  geom_point(data = . %>% filter(regulation == "NS"), alpha = 0.2, size = 0.6) +
+  geom_point(data = . %>% filter(regulation != "NS"), alpha = 0.7, size = 1.2) +
+  geom_hline(yintercept = 0, linewidth = 0.8, color = "grey20") +
+  geom_hline(yintercept = c(-1, 1), linetype = "dashed", color = "grey50", linewidth = 0.5) +
+  scale_color_manual(values = c(Up = "#D62728", Down = "#1F77B4", NS = "grey75"), name = NULL) +
+  labs(
+    title = "MA Plot (after apeglm shrinkage)",
+    x     = expression(log[10]~"(Mean expression)"),
+    y     = expression(log[2]~"Fold Change")
+  )
+
+print(p_ma)
+ggsave("output/plots/07_MA_plot.png", p_ma, width = 9, height = 5, dpi = 150)
+```
+
+The MA plot confirms that DE genes are spread across the full range of expression levels, though the effect is stronger for lowly expressed genes as expected after LFC shrinkage. The overall distribution is slightly skewed downward, consistent with the larger number of downregulated genes.
+
+## 6.3 Top 50 DE Genes Heatmap
+
+```{r heatmap-top-genes, fig.height=12, fig.width=10}
+top50_genes <- res_df %>%
+  filter(regulation != "NS") %>%
+  arrange(padj) %>%
+  head(50) %>%
+  pull(gene)
+
+vst_top50  <- assay(vsd)[top50_genes, ]
+vst_scaled <- t(scale(t(vst_top50)))
+
+heatmap_long <- vst_scaled %>%
+  as.data.frame() %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "zscore") %>%
+  left_join(metadata %>% select(sample, condition), by = "sample")
+
+sample_order <- metadata %>% arrange(condition, sample) %>% pull(sample)
+gene_order   <- res_df %>% filter(gene %in% top50_genes) %>%
+  arrange(desc(log2FoldChange)) %>% pull(gene)
+
+heatmap_long <- heatmap_long %>%
+  mutate(
+    gene   = factor(gene,   levels = gene_order),
+    sample = factor(sample, levels = sample_order)
+  )
+
+p_heatmap <- ggplot(heatmap_long, aes(x = sample, y = gene, fill = zscore)) +
+  geom_tile(color = NA) +
+  scale_fill_gradientn(
+    colours = c("#053061", "#2166AC", "#4393C3", "white", "#D6604D", "#B2182B", "#67001F"),
+    limits  = c(-3, 3),
+    oob     = scales::squish,
+    name    = "Z-score"
+  ) +
+  facet_grid(. ~ condition, scales = "free_x", space = "free_x") +
+  labs(title    = "Heatmap — Top 50 DE genes (VST Z-score)",
+       subtitle = "Sorted by decreasing log2FC · left: Adjacent · right: Tumor",
+       x = NULL, y = NULL) +
+  theme(
+    axis.text.x      = element_text(angle = 90, hjust = 1, size = 5),
+    axis.text.y      = element_text(size = 7),
+    strip.background = element_rect(fill = "grey90", color = NA),
+    strip.text       = element_text(face = "bold", size = 11),
+    panel.spacing    = unit(0.5, "mm"),
+    panel.border     = element_blank(),
+    panel.grid       = element_blank()
+  )
+
+print(p_heatmap)
+ggsave("output/plots/08_heatmap_top50_DE.png", p_heatmap, width = 11, height = 13, dpi = 150)
+```
+
+The heatmap shows a clear separation between the two conditions for the top 50 DE genes. Upregulated genes (top rows) are consistently highly expressed in Tumor samples, while downregulated genes (bottom rows) show the opposite pattern. The within-group consistency across replicates confirms the robustness of the results.
+
+## 6.4 Top Up/Down Genes Barplot
+
+```{r barplot-top-genes, fig.height=6}
+top_bar <- bind_rows(
+  res_df %>% filter(regulation == "Up")   %>% arrange(desc(log2FoldChange)) %>% head(15),
+  res_df %>% filter(regulation == "Down") %>% arrange(log2FoldChange)       %>% head(15)
+) %>%
+  mutate(gene = factor(gene, levels = gene))
+
+p_bar <- ggplot(top_bar,
+                aes(x = log2FoldChange, y = reorder(gene, log2FoldChange), fill = regulation)) +
+  geom_col(width = 0.7, alpha = 0.85) +
+  geom_vline(xintercept = 0, linewidth = 0.6) +
+  geom_errorbarh(aes(xmin = log2FoldChange - lfcSE, xmax = log2FoldChange + lfcSE),
+                 height = 0.3, linewidth = 0.5, color = "grey30") +
+  scale_fill_manual(values = c(Up = "#D62728", Down = "#1F77B4"), name = NULL) +
+  labs(title    = "Top 15 up- and downregulated genes in Tumor",
+       subtitle = "log2 Fold Change ± SE (apeglm shrinkage)",
+       x        = expression(log[2]~"Fold Change"),
+       y        = NULL)
+
+print(p_bar)
+ggsave("output/plots/09_barplot_top_genes.png", p_bar, width = 9, height = 7, dpi = 150)
+```
+
+The barplot shows that the top downregulated genes generally have larger fold changes than the top upregulated ones, which is consistent with the overall asymmetry observed in the volcano plot. The error bars (LFC ± SE) are narrow for most genes, reflecting well-estimated effect sizes.
+
+---
+
+# 7. GO Functional Enrichment (clusterProfiler)
+
+```{r go-check}
+has_go <- all(vapply(
+  c("clusterProfiler", "org.Hs.eg.db", "enrichplot"),
+  requireNamespace, logical(1), quietly = TRUE
+))
+
+if (!has_go) {
+  message("Install with: BiocManager::install(c('clusterProfiler','org.Hs.eg.db','enrichplot'))")
+}
+```
+
+```{r go-analysis}
+if (has_go) {
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(enrichplot)
+
+  up_genes   <- res_df %>% filter(regulation == "Up")   %>% pull(gene)
+  down_genes <- res_df %>% filter(regulation == "Down") %>% pull(gene)
+  bg_genes   <- res_df %>% pull(gene)
+
+  run_go_bp <- function(gene_list, label, bg) {
+    ego <- enrichGO(
+      gene          = gene_list,
+      universe      = bg,
+      OrgDb         = org.Hs.eg.db,
+      keyType       = "SYMBOL",
+      ont           = "BP",
+      pAdjustMethod = "BH",
+      pvalueCutoff  = 0.05,
+      qvalueCutoff  = 0.20,
+      readable      = TRUE
+    )
+    if (!is.null(ego) && nrow(ego) > 0) {
+      ego_simplified <- clusterProfiler::simplify(ego, cutoff = 0.7,
+                                                   by = "p.adjust", select_fun = min)
+      write.csv(as.data.frame(ego_simplified),
+                file = paste0("output/results/GO_BP_", label, ".csv"), row.names = FALSE)
+      return(ego_simplified)
+    } else {
+      return(NULL)
+    }
+  }
+
+  ego_up   <- run_go_bp(up_genes,   "Up_Tumor",   bg_genes)
+  ego_down <- run_go_bp(down_genes, "Down_Tumor", bg_genes)
+}
+```
+
+## 7.1 Dot Plot — Upregulated Genes
+
+```{r go-dotplot-up, fig.height=7}
+if (has_go && !is.null(ego_up) && nrow(ego_up) > 0) {
+
+  go_up_df <- as.data.frame(ego_up) %>%
+    arrange(p.adjust) %>%
+    head(20) %>%
+    mutate(
+      Description   = str_wrap(Description, 45),
+      GeneRatio_num = as.numeric(sub("/.*", "", GeneRatio)) /
+                      as.numeric(sub(".*/", "", GeneRatio))
+    )
+
+  p_go_up <- ggplot(go_up_df,
+                    aes(x = GeneRatio_num,
+                        y = reorder(Description, GeneRatio_num),
+                        color = p.adjust, size = Count)) +
+    geom_point(alpha = 0.85) +
+    scale_color_gradientn(
+      colours = c("#D62728", "#FF7F0E", "#BCBD22"),
+      name = "p.adjust", trans = "log10", labels = scientific
+    ) +
+    scale_size_continuous(range = c(3, 10), name = "Gene count") +
+    labs(title    = "GO BP Enrichment — Upregulated Genes in Tumor",
+         subtitle = "Top 20 simplified terms (clusterProfiler)",
+         x = "Gene Ratio", y = NULL) +
+    theme(axis.text.y = element_text(size = 9))
+
+  print(p_go_up)
+  ggsave("output/plots/10_GO_BP_up_dotplot.png", p_go_up, width = 11, height = 8, dpi = 150)
+}
+```
+
+The most significantly enriched terms for upregulated genes are related to cell division and chromosome dynamics (nuclear division, chromosome segregation, mitotic cell cycle). This is a hallmark of tumor proliferation and suggests active cell cycle dysregulation in breast tumor tissue.
+
+## 7.2 Dot Plot — Downregulated Genes
+
+```{r go-dotplot-down, fig.height=7}
+if (has_go && !is.null(ego_down) && nrow(ego_down) > 0) {
+
+  go_down_df <- as.data.frame(ego_down) %>%
+    arrange(p.adjust) %>%
+    head(20) %>%
+    mutate(
+      Description   = str_wrap(Description, 45),
+      GeneRatio_num = as.numeric(sub("/.*", "", GeneRatio)) /
+                      as.numeric(sub(".*/", "", GeneRatio))
+    )
+
+  p_go_down <- ggplot(go_down_df,
+                      aes(x = GeneRatio_num,
+                          y = reorder(Description, GeneRatio_num),
+                          color = p.adjust, size = Count)) +
+    geom_point(alpha = 0.85) +
+    scale_color_gradientn(
+      colours = c("#1F77B4", "#AEC7E8", "#DBDB8D"),
+      name = "p.adjust", trans = "log10", labels = scientific
+    ) +
+    scale_size_continuous(range = c(3, 10), name = "Gene count") +
+    labs(title    = "GO BP Enrichment — Downregulated Genes in Tumor",
+         subtitle = "Top 20 simplified terms (clusterProfiler)",
+         x = "Gene Ratio", y = NULL) +
+    theme(axis.text.y = element_text(size = 9))
+
+  print(p_go_down)
+  ggsave("output/plots/11_GO_BP_down_dotplot.png", p_go_down, width = 11, height = 8, dpi = 150)
+}
+```
+
+Downregulated genes are enriched in terms associated with normal tissue homeostasis: circulatory system processes, membrane potential regulation, and muscle system processes. These results reflect the loss of mammary tissue identity during tumor development.
+
+## 7.3 Combined UP + DOWN Barplot
+
+```{r go-barplot-combined, fig.height=7}
+if (has_go && (!is.null(ego_up) || !is.null(ego_down))) {
+
+  make_go_summary <- function(ego_obj, direction) {
+    if (is.null(ego_obj) || nrow(ego_obj) == 0) return(NULL)
+    as.data.frame(ego_obj) %>%
+      head(10) %>%
+      mutate(
+        direction    = direction,
+        Description  = str_wrap(Description, 40),
+        neg_log10_p  = -log10(p.adjust),
+        signed_score = ifelse(direction == "Up", neg_log10_p, -neg_log10_p)
+      )
+  }
+
+  go_combined <- bind_rows(
+    make_go_summary(ego_up,   "Up"),
+    make_go_summary(ego_down, "Down")
+  )
+
+  if (!is.null(go_combined) && nrow(go_combined) > 0) {
+    p_go_comb <- ggplot(go_combined,
+                        aes(x = signed_score,
+                            y = reorder(Description, signed_score),
+                            fill = direction)) +
+      geom_col(width = 0.75, alpha = 0.85) +
+      geom_vline(xintercept = 0, linewidth = 0.8) +
+      scale_fill_manual(values = c(Up = "#D62728", Down = "#1F77B4"),
+                        name = "Regulation\n(in Tumor)") +
+      scale_x_continuous(labels = function(x) paste0(abs(x))) +
+      labs(title    = "GO BP Enrichment — Combined View",
+           subtitle = "Score: -log10(p.adj) · Right: Up Tumor · Left: Down Tumor",
+           x        = expression(-log[10]~"(p.adjust)"),
+           y        = NULL) +
+      theme(axis.text.y = element_text(size = 8))
+
+    print(p_go_comb)
+    ggsave("output/plots/12_GO_BP_combined_barplot.png", p_go_comb,
+           width = 11, height = 8, dpi = 150)
+  }
+}
+```
+
+The combined barplot summarizes the contrast between the two gene sets: upregulated genes drive proliferative processes (right side) while downregulated genes reflect loss of tissue-specific functions (left side). The asymmetry in enrichment scores also reflects the larger number and stronger significance of downregulated pathways.
+
+---
+
+# 8. Discussion
+
+## 8.1 Sample Quality and Group Separation
+
+The principal component analysis (section 5.3) shows a clear separation between Tumor and Adjacent samples along PC1, confirming that the two groups have distinct transcriptomic profiles. The low within-group variance strengthens the statistical power of the analysis.
+
+The sample distance heatmap (section 5.4) confirms this: samples from the same condition cluster together consistently, validating the quality of the dataset and the absence of major sequencing artefacts.
+
+## 8.2 Differentially Expressed Genes
+
+```{r discussion-stats, echo=FALSE}
+n_up     <- sum(res_df$regulation == "Up",   na.rm = TRUE)
+n_down   <- sum(res_df$regulation == "Down", na.rm = TRUE)
+n_tested <- nrow(res_df)
+top5_up   <- res_df %>% filter(regulation == "Up")   %>% head(5) %>% pull(gene)
+top5_down <- res_df %>% filter(regulation == "Down") %>% head(5) %>% pull(gene)
+
+cat(sprintf("Genes tested: %d\nUp: %d  |  Down: %d\n", n_tested, n_up, n_down))
+cat("Top 5 up  :", paste(top5_up,   collapse = ", "), "\n")
+cat("Top 5 down:", paste(top5_down, collapse = ", "), "\n")
+```
+
+DESeq2 with BH correction (FDR < 5%) identified `r n_up + n_down` differentially expressed genes out of `r n_tested` tested. The strong bias toward downregulation in tumor tissue (`r n_down` down vs `r n_up` up) reflects the loss of tissue-specific identity characteristic of breast cancer dedifferentiation.
+
+## 8.3 Biological Interpretation
+
+**Upregulated genes** are enriched in cell proliferation processes: chromosome organization, nuclear division, mitotic cell cycle phase transitions and DNA replication. These results are consistent with the transcriptional activation observed in breast tumors.
+
+**Downregulated genes** are associated with normal mammary tissue functions: circulatory processes, membrane potential regulation, muscle system processes and hormone level regulation. This loss of tissue-specific functions reflects tumor dedifferentiation.
+
+## 8.4 Methodological Limitations
+
+1. **FPKM to pseudo-counts conversion**: the proportional scaling used here is an approximation. Raw count data from alignment tools would be preferable for a fully rigorous analysis.
+
+2. **No correction for confounding variables**: age, tumor grade and molecular subtype are not included in the current model.
+
+3. **Unpaired design**: a paired model (`~ patient + condition`) would better control for inter-individual variability.
+
+---
+
+# 9. Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+---
+
+*Analysis generated on `r format(Sys.Date(), "%B %d, %Y")` · GEO dataset: [GSE183947](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE183947)*
