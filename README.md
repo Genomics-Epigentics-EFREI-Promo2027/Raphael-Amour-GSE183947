@@ -22,18 +22,6 @@ The dataset comes from a study identifying cytotoxicity-related genes involved i
 
 GO enrichment revealed activation of mitotic and chromosomal processes in upregulated genes (chromosome organization, nuclear division, mitotic cell cycle), consistent with uncontrolled tumor proliferation. Downregulated genes were enriched in tissue-specific functions such as circulatory and muscle system processes, reflecting tumor dedifferentiation.
 
-## Repository Structure
-
-```
-├── analysis.Rmd
-├── analysis.html
-├── data/
-│   └── GSE183947_fpkm.csv
-└── output/
-    ├── plots/
-    └── results/
-```
-
 ## How to Run
 
 ```bash
